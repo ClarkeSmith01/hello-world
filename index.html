@@ -14,111 +14,118 @@
 <span id="status" class="sr" aria-live="polite">Move to spin.</span>
 <script>
 'use strict';
-const canvas=document.getElementById('field'),ctx=canvas.getContext('2d',{alpha:false});
-const status=document.getElementById('status');
-const TAU=Math.PI*2,reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
-let w=0,h=0,dpr=1,glyphSize=19,glyphs=[],cells=[],progress=0,energy=0,raf=0,last=0,announced=false;
-let pointer={x:-1000,y:-1000,previousX:null,previousY:null};
+const TAU=Math.PI*2,STEP=1/120;
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
-const ease=x=>x*x*(3-2*x);
+const wrap=a=>Math.atan2(Math.sin(a),Math.cos(a));
+// Independent inertial rotors, coupled to their four immediate neighbors.
+// Simulation uses a fixed timestep so damping and capture do not depend on FPS.
+class RotorField {
+ constructor(cells,cols,rows){this.cells=cells;this.cols=cols;this.rows=rows;this.forces=new Float64Array(cells.length)}
+ impulse(ax,ay,bx,by,seconds,radius){
+  const dx=bx-ax,dy=by-ay,len=Math.hypot(dx,dy);if(len<.1)return;
+  const speed=Math.min(2400,len/Math.max(seconds,1/240)),nx=dx/len,ny=dy/len;
+  for(const c of this.cells){
+   if(c.locked)continue;
+   const t=clamp(((c.x-ax)*dx+(c.y-ay)*dy)/(len*len),0,1);
+   const rx=c.x-(ax+dx*t),ry=c.y-(ay+dy*t),r=Math.hypot(rx,ry);
+   if(r>=radius)continue;
+   const falloff=(1-r/radius)**2;
+   // Tangential drag produces opposite rotation on opposite sides of the wake.
+   const tangent=(nx*ry-ny*rx)/radius;
+   const drag=nx*.42-ny*.24+tangent*1.8;
+   c.velocity=clamp(c.velocity+drag*falloff*len*.18*(.55+speed/1600),-26,26);
+  }
+ }
+ step(dt){
+  const cells=this.cells,cols=this.cols;let active=false;
+  for(let i=0;i<cells.length;i++){
+   const c=cells[i];let torque=0;
+   if(c.locked){torque=75*wrap(c.target-c.angle)-13*c.velocity}
+   else{
+    // Periodic torsion springs allow complete revolutions without winding up.
+    const neighbors=[i%cols?i-1:-1,i%cols<cols-1?i+1:-1,i>=cols?i-cols:-1,i+cols<cells.length?i+cols:-1];
+    for(const j of neighbors)if(j>=0)torque+=24*Math.sin(2*(cells[j].angle-c.angle));
+    torque-=1.8*Math.sin(2*c.angle)+1.65*c.velocity;
+   }
+   this.forces[i]=torque;
+  }
+  for(let i=0;i<cells.length;i++){
+   const c=cells[i];c.velocity+=this.forces[i]*dt;c.angle+=c.velocity*dt;
+   c.travel+=Math.abs(c.velocity)*dt;
+   if(c.ink&&!c.locked&&c.travel>.75){
+    c.locked=true;c.target=Math.round((c.angle+c.velocity*.10)/Math.PI)*Math.PI;
+   }
+   if(c.locked){
+    const ready=1-clamp(Math.abs(wrap(c.target-c.angle))/.7,0,1);
+    c.shade+=(ready-c.shade)*(1-Math.exp(-dt*7));
+    if(Math.abs(c.velocity)<.008&&Math.abs(wrap(c.target-c.angle))<.002){c.angle=c.target;c.velocity=0}
+   }
+   if(Math.abs(c.velocity)>.004||Math.abs(Math.sin(2*c.angle))>.004||(c.locked&&c.shade<.999))active=true;
+  }
+  return active;
+ }
+}
+const canvas=document.getElementById('field'),ctx=canvas.getContext('2d',{alpha:false}),status=document.getElementById('status');
+const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+let w=0,h=0,dpr=1,glyphs=[],field,raf=0,last=0,accumulator=0,announced=false;
+let pointer=null;
 function resize(){
  w=innerWidth;h=innerHeight;dpr=Math.min(devicePixelRatio||1,2);
  canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
- ctx.setTransform(dpr,0,0,dpr,0,0);
- const gapX=Math.max(4,Math.min(12,w/120)),gapY=gapX*1.5;glyphSize=gapY*1.055;
- const columns=Math.ceil(w/gapX),rows=Math.ceil(h/gapY);
- glyphs=Array.from({length:64},(_,i)=>{
-  const g=document.createElement('canvas'),side=Math.ceil(glyphSize*1.8);g.width=g.height=Math.ceil(side*dpr);
-  const gc=g.getContext('2d');gc.scale(dpr,dpr);gc.translate(side/2,side/2);gc.rotate(i*TAU/64);
-  gc.font=`bold ${glyphSize}px "Courier New", monospace`;gc.textAlign='center';gc.textBaseline='middle';gc.fillText('|',0,0);
-  return {image:g,side};
+ const gapX=Math.max(4,Math.min(12,w/120)),gapY=gapX*1.5,glyphSize=gapY*1.055;
+ const cols=Math.ceil(w/gapX),rows=Math.ceil(h/gapY);
+ glyphs=Array.from({length:128},(_,i)=>{
+  const image=document.createElement('canvas'),side=Math.ceil(glyphSize*1.8);image.width=image.height=Math.ceil(side*dpr);
+  const g=image.getContext('2d');g.scale(dpr,dpr);g.translate(side/2,side/2);g.rotate(i*TAU/128);
+  g.font=`bold ${glyphSize}px "Courier New", monospace`;g.textAlign='center';g.textBaseline='middle';g.fillText('|',0,0);return{image,side};
  });
- const mask=document.createElement('canvas');mask.width=w;mask.height=h;
- const m=mask.getContext('2d',{willReadFrequently:true});
- let fontSize=Math.min(h*.34,w*.215);m.font=`900 ${fontSize}px Arial, sans-serif`;
- fontSize*=Math.min(1,w*.86/m.measureText('ARCHIE').width);
- m.font=`900 ${fontSize}px Arial, sans-serif`;m.textAlign='center';m.textBaseline='middle';
- m.fillText('ARCHIE',w/2,h/2+fontSize*.035);
- const pixels=m.getImageData(0,0,w,h).data;
- cells=[];
- for(let row=0;row<rows;row++)for(let col=0;col<columns;col++){
+ const mask=document.createElement('canvas');mask.width=w;mask.height=h;const m=mask.getContext('2d',{willReadFrequently:true});
+ let size=Math.min(h*.34,w*.215);m.font=`900 ${size}px Arial, sans-serif`;size*=Math.min(1,w*.86/m.measureText('ARCHIE').width);
+ m.font=`900 ${size}px Arial, sans-serif`;m.textAlign='center';m.textBaseline='middle';m.fillText('ARCHIE',w/2,h/2+size*.035);
+ const p=m.getImageData(0,0,w,h).data,cells=[];
+ for(let row=0;row<rows;row++)for(let col=0;col<cols;col++){
   const x=col*gapX+gapX/2,y=row*gapY+gapY/2;
-  const px=Math.min(w-1,Math.floor(x)),py=Math.min(h-1,Math.floor(y));
-  const ink=pixels[(py*w+px)*4+3]>100;
-  const seed=((col*73+row*137)%101)/101;
-  cells.push({x,y,ink,angle:0,velocity:0,lock:null,settled:false,shade:0,threshold:.12+.57*(x/w)+seed*.12,seed,length:gapY*.72});
+  const ink=p[(Math.min(h-1,Math.floor(y))*w+Math.min(w-1,Math.floor(x)))*4+3]>100;
+  cells.push({x,y,ink,angle:0,velocity:0,travel:0,locked:false,target:0,shade:0});
  }
- requestFrame();
+ field=new RotorField(cells,cols,rows);pointer=null;announced=false;requestFrame();
 }
-function requestFrame(){if(!raf){last=0;raf=requestAnimationFrame(tick)}}
-function stimulate(x,y,travel){
- pointer.x=x;pointer.y=y;
- const force=clamp(travel/24,.15,2.5);
- energy=Math.min(2.2,energy+force*.24);
- progress=Math.min(1,progress+travel/Math.max(360,w*.85));
- const radius=Math.max(100,Math.min(w,h)*.22),radius2=radius*radius;
- for(const c of cells){
-  if(c.lock!==null)continue;
-  const dx=c.x-x,dy=c.y-y,d2=dx*dx+dy*dy;
-  // Every mark responds; nearby marks turn faster, carrying a ripple through the field.
-  const near=Math.max(0,1-d2/radius2);
-  c.velocity=Math.min(18,c.velocity+force*(.32+near*5));
+function requestFrame(){if(!raf){last=0;accumulator=0;raf=requestAnimationFrame(tick)}}
+function paint(){
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.globalAlpha=1;ctx.fillStyle='#e8e8e8';ctx.fillRect(0,0,w,h);
+ let settled=0,total=0;
+ for(const c of field.cells){
+  const phase=((c.angle%TAU)+TAU)%TAU;
+  const g=glyphs[Math.round(phase/TAU*128)%128];
+  ctx.globalAlpha=.30+c.shade*.62;ctx.drawImage(g.image,c.x-g.side/2,c.y-g.side/2,g.side,g.side);
+  if(c.ink){total++;if(c.locked&&c.shade>.98)settled++}
  }
- requestFrame();
-}
-function move(e){
- const x=e.clientX,y=e.clientY;
- const distance=pointer.previousX===null?14:Math.hypot(x-pointer.previousX,y-pointer.previousY);
- pointer.previousX=x;pointer.previousY=y;
- if(distance>.1)stimulate(x,y,Math.min(distance,100));
-}
-function reset(){
- progress=0;energy=0;announced=false;pointer.previousX=pointer.previousY=null;
- for(const c of cells){c.angle=0;c.velocity=0;c.lock=null;c.settled=false;c.shade=0}
- status.textContent='Move to spin.';requestFrame();
+ canvas.dataset.locked=String(settled);canvas.dataset.letters=String(total);
+ if(total&&settled/total>.96&&!announced){announced=true;status.textContent='ARCHIE is locked. The surrounding lines still respond to your mouse.'}
 }
 function tick(now){
- raf=0;const dt=last?Math.min((now-last)/1000,.04):1/60;last=now;
- energy*=Math.exp(-dt*2.2);
- ctx.setTransform(dpr,0,0,dpr,0,0);ctx.globalAlpha=1;ctx.fillStyle='#e8e8e8';ctx.fillRect(0,0,w,h);
- ctx.font=`${glyphSize}px "Courier New", monospace`;ctx.textAlign='center';ctx.textBaseline='middle';
- let active=false,locked=0,total=0;
- for(const c of cells){
-  if(c.ink){
-   total++;
-   if(c.lock===null&&progress>=c.threshold){
-    // Finish a turn, then latch upright. Locked letters ignore later mouse movement.
-    c.lock=(Math.floor(c.angle/Math.PI)+1)*Math.PI;
-   }
-  }
-  if(c.lock!==null){
-   const remaining=c.lock-c.angle;
-   c.angle+=remaining*(1-Math.exp(-dt*(reduced?12:5.4)));
-   c.shade+=(1-c.shade)*(1-Math.exp(-dt*5));
-   c.velocity=0;
-   if(Math.abs(remaining)<.003){c.angle=c.lock;c.settled=true;locked++}else active=true;
-   if(c.shade<.999)active=true;
-  }else{
-   c.angle+=c.velocity*dt*(reduced?.22:1);
-   c.velocity*=Math.exp(-dt*2.1);
-   if(c.velocity>.006)active=true;else c.velocity=0;
-  }
-  // The lettering is made from the same ASCII pipes as the surrounding field.
-  const background=116+progress*65;
-  const shade=Math.round(background*(1-c.shade)+24*c.shade);
-  const glyph=glyphs[Math.round((c.angle%TAU)/TAU*64)%64];
-  ctx.globalAlpha=(232-shade)/232;ctx.drawImage(glyph.image,c.x-glyph.side/2,c.y-glyph.side/2,glyph.side,glyph.side);
- }
- if(total&&locked===total&&!announced){announced=true;status.textContent='ARCHIE. Move to keep the surrounding lines spinning. Escape resets.'}
- if(active||energy>.003)raf=requestAnimationFrame(tick);else last=0;
+ raf=0;accumulator+=last?Math.min((now-last)/1000,.08):STEP;last=now;let active=false;
+ while(accumulator>=STEP){active=field.step(STEP)||active;accumulator-=STEP}
+ paint();
+ if(active)raf=requestAnimationFrame(tick);else{last=0;accumulator=0}
 }
+function move(e){
+ const next={x:e.clientX,y:e.clientY,time:e.timeStamp};
+ if(pointer){
+  field.impulse(pointer.x,pointer.y,next.x,next.y,Math.max(.001,(next.time-pointer.time)/1000),Math.max(65,Math.min(w,h)*.19)*(reduced?.7:1));
+  requestFrame();
+ }
+ pointer=next;
+}
+function reset(){for(const c of field.cells){c.angle=c.velocity=c.travel=c.target=c.shade=0;c.locked=false}pointer=null;announced=false;status.textContent='Move to spin.';requestFrame()}
 canvas.addEventListener('pointermove',move);
-canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);move(e)});
-canvas.addEventListener('pointerleave',()=>{pointer.previousX=pointer.previousY=null});
+canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);pointer={x:e.clientX,y:e.clientY,time:e.timeStamp}});
+canvas.addEventListener('pointerleave',()=>{pointer=null});
+canvas.addEventListener('pointercancel',()=>{pointer=null});
 canvas.addEventListener('dblclick',reset);
 addEventListener('keydown',e=>{
  if(e.key==='Escape')reset();
- if(e.key===' '||e.key.startsWith('Arrow')){e.preventDefault();stimulate(w/2,h/2,w*.15)}
+ if(e.key===' '||e.key.startsWith('Arrow')){e.preventDefault();const backwards=['ArrowLeft','ArrowDown'].includes(e.key);field.impulse(backwards?w:0,h/2,backwards?0:w,h/2,.35,Math.max(80,h*.2));requestFrame()}
 });
 addEventListener('resize',resize);
 document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelAnimationFrame(raf);raf=0;last=0}else requestFrame()});
